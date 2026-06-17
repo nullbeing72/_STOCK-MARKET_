@@ -178,6 +178,87 @@ class HybridModel(nn.Module):
         return self.head(pooled)
 
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 1024):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]])
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, : x.size(1)]
+
+
+class TransformerForecastModel(nn.Module):
+    """Modular Transformer encoder alternative with feature projection."""
+    def __init__(
+        self,
+        input_size: int,
+        d_model: int = 128,
+        num_heads: int = 4,
+        num_layers: int = 3,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        actual_heads = num_heads
+        while d_model % actual_heads != 0 and actual_heads > 1:
+            actual_heads -= 1
+        self.input_proj = nn.Linear(input_size, d_model)
+        self.pos = PositionalEncoding(d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=actual_heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.feature_gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.pos(self.input_proj(x))
+        z = self.encoder(z)
+        pooled = z.mean(dim=1)
+        return self.head(pooled * self.feature_gate(pooled))
+
+
+def build_model(
+    architecture: str,
+    input_size: int,
+    hidden_size: int = 128,
+    dropout: float = 0.2,
+    cnn_channels: int = 64,
+    num_heads: int = 4,
+) -> nn.Module:
+    architecture = (architecture or "hybrid").lower()
+    if architecture in {"transformer", "transformer_encoder"}:
+        return TransformerForecastModel(
+            input_size=input_size,
+            d_model=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+    return HybridModel(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        cnn_channels=cnn_channels,
+        num_heads=num_heads,
+        dropout=dropout,
+    )
+
+
 # ── Training callback type ────────────────────────────────────────────────────
 EpochCallback = Callable[[int, int, float, float, float], bool]
 
@@ -194,10 +275,13 @@ def train_model(
     dropout:          float = 0.2,
     cnn_channels:     int   = 64,
     num_heads:        int   = 4,
+    architecture:     str   = "hybrid",
     direction_weight: float = 0.4,   # NEW: per-stock adaptive weight
     epoch_callback:   Optional[EpochCallback] = None,
 ) -> tuple[HybridModel, dict]:
-    model     = HybridModel(input_size, hidden_size, 2, cnn_channels, num_heads, dropout).to(device)
+    model     = build_model(
+        architecture, input_size, hidden_size, dropout, cnn_channels, num_heads,
+    ).to(device)
     criterion = AdaptiveCombinedLoss(delta=0.01)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(

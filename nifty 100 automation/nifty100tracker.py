@@ -79,6 +79,7 @@ try:
         CLOSE_IDX, FACTOR_FEATURE_COLS, FEATURE_COLS, PRICE_FEATURE_COLS,
         add_quant_features, add_technical_features, fetch_bond_yields,
         fetch_commodities, fetch_data, fetch_market_data,
+        fetch_macro_indicators, fetch_fundamentals,
         build_sequences, split_data, returns_to_prices,
         validate_feature_matrix,                        # ← now imported
     )
@@ -91,6 +92,18 @@ try:
 except ImportError as _e:
     _ML_AVAILABLE = False
     print(f"[WARN] ML modules not fully available: {_e}. Predictions will be skipped.")
+
+from platform_calendar import NSEExchangeCalendar
+from research_platform import (
+    ExperimentTracker,
+    MarketDataProviderChain,
+    NotificationManager,
+    ResearchStore,
+    compute_drift_report,
+    detect_market_regime,
+    rank_opportunities,
+    sector_rotation,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,9 +167,17 @@ DATA_DIR   = BASE_DIR / "nifty100_data"
 MODELS_DIR = BASE_DIR / "nifty100_models"
 LOGS_DIR   = BASE_DIR / "logs"
 STATE_FILE = BASE_DIR / "tracker_state.json"
+CALENDAR_FILE = BASE_DIR / "nse_calendar.json"
+DB_FILE = BASE_DIR / "nifty100_research.db"
 
 for _d in (DATA_DIR, MODELS_DIR, LOGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+EXCHANGE_CALENDAR = NSEExchangeCalendar(CALENDAR_FILE)
+RESEARCH_STORE = ResearchStore(DB_FILE)
+DATA_PROVIDER = MarketDataProviderChain(fetch_data) if _ML_AVAILABLE else None
+EXPERIMENTS = ExperimentTracker(os.getenv("MLFLOW_TRACKING_URI"))
+NOTIFICATIONS = NotificationManager()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -199,12 +220,7 @@ NSE_HOLIDAYS: set[date] = {
 }
 
 def is_market_open(check_date: Optional[date] = None) -> tuple[bool, str]:
-    d = check_date or date.today()
-    if d.weekday() >= 5:
-        return False, f"{d.strftime('%A')} — NSE closed on weekends"
-    if d in NSE_HOLIDAYS:
-        return False, f"{d.isoformat()} is an NSE public holiday"
-    return True, ""
+    return EXCHANGE_CALENDAR.is_trading_day(check_date)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -577,6 +593,12 @@ EXCEL_COLUMNS = [
     "SMA_10", "SMA_50", "MACD", "MACD_Signal", "RSI", "ROC_10",
     "Stoch_K", "BB_Upper", "BB_Lower", "ATR", "OBV_norm", "RVI",
     "Beta_60", "Alpha_60", "Momentum_12_1", "Sharpe_60", "Vol_Ratio", "Mkt_Return",
+    "Bond_5Y", "Bond_10Y", "Gold", "Silver", "Copper", "Aluminium", "Brent_Oil",
+    "Buffett_Proxy", "USDINR", "DXY", "India_VIX", "FII_Flow", "DII_Flow",
+    "Repo_Rate", "CPI_Inflation", "PMI", "GDP_Growth",
+    "PE_Ratio", "PB_Ratio", "EPS_Growth", "ROE", "ROCE",
+    "Debt_To_Equity", "Institutional_Ownership",
+    "Market_Regime", "Regime_Confidence",
     "Yest_Pred_Mean", "Yest_Pred_Std",
     "Today_Pred_Mean", "Today_Pred_Std",
     "Actual_Price",
@@ -588,13 +610,13 @@ EXCEL_COLUMNS = [
 _SECTION_HEADERS = [
     (1,  1,  "DATE"),
     (2,  6,  "OHLCV"),
-    (7,  24, "ENGINEERED FEATURES"),
-    (25, 26, "YESTERDAY'S PREDICTION"),
-    (27, 28, "TODAY'S PREDICTION"),
-    (29, 29, "ACTUAL PRICE"),
-    (30, 31, "TOMORROW'S PREDICTION"),
-    (32, 33, "ERROR 1 (|YEST PRED – TODAY PRED|)"),
-    (34, 35, "ERROR 2 (|TODAY PRED – ACTUAL PRICE|)"),
+    (7,  50, "ENGINEERED FEATURES"),
+    (51, 52, "YESTERDAY'S PREDICTION"),
+    (53, 54, "TODAY'S PREDICTION"),
+    (55, 55, "ACTUAL PRICE"),
+    (56, 57, "TOMORROW'S PREDICTION"),
+    (58, 59, "ERROR 1 (|YEST PRED - TODAY PRED|)"),
+    (60, 61, "ERROR 2 (|TODAY PRED - ACTUAL PRICE|)"),
 ]
 
 _STYLE_HEADER_TOP = {
@@ -649,7 +671,7 @@ def create_xlsx_template(path: Path, company_name: str, ticker: str) -> None:
         cell = ws.cell(row=3, column=i, value=col)
         _apply_style(cell, _STYLE_HEADER_MID)
         ws.column_dimensions[get_column_letter(i)].width = (
-            12 if i == 1 else 8 if i <= 6 else 11 if i <= 24 else 13
+            12 if i == 1 else 8 if i <= 6 else 11 if i <= 50 else 13
         )
     ws.row_dimensions[3].height = 28
     ws.freeze_panes = "A4"
@@ -751,6 +773,13 @@ def append_row_to_xlsx(path: Path, row_data: dict) -> bool:
     try:
         wb = load_workbook(path)
         ws = wb.active
+        if ws.max_column < len(EXCEL_COLUMNS):
+            for i, col in enumerate(EXCEL_COLUMNS, start=1):
+                cell = ws.cell(row=3, column=i, value=col)
+                _apply_style(cell, _STYLE_HEADER_MID)
+                ws.column_dimensions[get_column_letter(i)].width = (
+                    12 if i == 1 else 8 if i <= 6 else 11 if i <= 50 else 13
+                )
         next_row = ws.max_row + 1
 
         row_values = [row_data.get(col) for col in EXCEL_COLUMNS]
@@ -895,8 +924,8 @@ def _get_model(
 
 def _fetch_auxiliary_data(period_days: int) -> tuple:
     """
-    Fetch market benchmark, bond yields, and commodities concurrently.
-    Returns (market_df, bond_df, comm_df) — any may be None on failure.
+    Fetch market benchmark, bond yields, commodities, and macro series concurrently.
+    Returns (market_df, bond_df, comm_df, macro_df) — any may be None on failure.
     """
     results: dict = {}
 
@@ -907,16 +936,17 @@ def _fetch_auxiliary_data(period_days: int) -> tuple:
             log.warning("Concurrent fetch failed for '%s': %s", key, e)
             results[key] = None
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {
             pool.submit(_do, "market", fetch_market_data, period_days): "market",
             pool.submit(_do, "bonds",  fetch_bond_yields,  period_days): "bonds",
             pool.submit(_do, "comms",  fetch_commodities,  period_days): "comms",
+            pool.submit(_do, "macro",  fetch_macro_indicators, period_days): "macro",
         }
         for f in as_completed(futures):
             pass  # results populated via _do side-effect
 
-    return results.get("market"), results.get("bonds"), results.get("comms")
+    return results.get("market"), results.get("bonds"), results.get("comms"), results.get("macro")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1001,10 +1031,18 @@ def process_ticker(
 
     # ── 2. Fetch OHLCV (with retry) ───────────────────────────────────────
     log.info("[%s] Fetching price data…", ticker)
-    raw_df = _retry(fetch_data, ticker, PERIOD_DAYS, retries=3, delay=5.0)
+    if DATA_PROVIDER is not None:
+        fetch_result = DATA_PROVIDER.fetch_ohlcv(ticker, PERIOD_DAYS)
+        raw_df = fetch_result.data
+        for warning in fetch_result.warnings:
+            log.warning("[%s] Provider failover: %s", ticker, warning)
+        log.info("[%s] OHLCV provider: %s", ticker, fetch_result.provider)
+    else:
+        raw_df = _retry(fetch_data, ticker, PERIOD_DAYS, retries=3, delay=5.0)
     if raw_df is None or raw_df.empty:
         log.error("[%s] No price data returned", ticker)
         return "error"
+    RESEARCH_STORE.upsert_market_data(ticker, raw_df, source="provider_chain")
 
     # ── INTELLIGENCE: Validate & clean data ───────────────────────────────
     raw_df, val_warnings = validate_ohlcv(raw_df, ticker)
@@ -1014,15 +1052,24 @@ def process_ticker(
     # ── 3. Feature engineering (concurrent auxiliary fetch) ───────────────
     log.info("[%s] Engineering features (parallel aux fetch)…", ticker)
     try:
-        mkt, bonds, comms = _fetch_auxiliary_data(PERIOD_DAYS)
+        mkt, bonds, comms, macro = _fetch_auxiliary_data(PERIOD_DAYS)
+        fundamentals = fetch_fundamentals(ticker)
 
         if mkt is None or mkt.empty:
             log.warning("[%s] Market data unavailable — using stock data as proxy", ticker)
             mkt = raw_df
 
         df = add_technical_features(raw_df)
-        df = add_quant_features(df, mkt, bonds, comms)
+        df = add_quant_features(df, mkt, bonds, comms, macro, fundamentals)
         df = df.dropna(subset=["Close"])
+        regime_report = detect_market_regime(mkt, macro["India_VIX"] if macro is not None and "India_VIX" in macro else None)
+        drift_report = compute_drift_report(
+            df,
+            ["Close", "Mkt_Return", "Vol_Ratio", "RSI", "India_VIX", "USDINR"],
+        )
+        if drift_report.get("drift_detected"):
+            log.warning("[%s] Statistical drift detected: %s", ticker, drift_report)
+            force_retrain = True
     except Exception as e:
         log.error("[%s] Feature engineering failed: %s\n%s", ticker, e, traceback.format_exc())
         return "error"
@@ -1212,6 +1259,18 @@ def process_ticker(
                 "Vol_Ratio", "Mkt_Return"]:
         row[col] = _safe(today_row.get(col))
 
+    for col in [
+        "Bond_5Y", "Bond_10Y", "Gold", "Silver", "Copper", "Aluminium", "Brent_Oil",
+        "Buffett_Proxy", "USDINR", "DXY", "India_VIX", "FII_Flow", "DII_Flow",
+        "Repo_Rate", "CPI_Inflation", "PMI", "GDP_Growth",
+        "PE_Ratio", "PB_Ratio", "EPS_Growth", "ROE", "ROCE",
+        "Debt_To_Equity", "Institutional_Ownership",
+    ]:
+        row[col] = _safe(today_row.get(col))
+
+    row["Market_Regime"] = regime_report.get("regime") if "regime_report" in locals() else None
+    row["Regime_Confidence"] = regime_report.get("confidence") if "regime_report" in locals() else None
+
     row["Yest_Pred_Mean"]     = yest_pred_mean
     row["Yest_Pred_Std"]      = yest_pred_std
     row["Today_Pred_Mean"]    = today_pred_mean
@@ -1223,10 +1282,46 @@ def process_ticker(
     row["Error1_Pct"] = round(error1_pct, 4) if error1_pct is not None else None
     row["Error2_Abs"] = round(error2_abs, 4) if error2_abs is not None else None
     row["Error2_Pct"] = round(error2_pct, 4) if error2_pct is not None else None
-
     # ── 7. Append to Excel ────────────────────────────────────────────────
     ok = append_row_to_xlsx(xlsx_path, row)
     if ok:
+        date_iso = target_date.isoformat()
+        try:
+            RESEARCH_STORE.upsert_feature_row(
+                ticker,
+                date_iso,
+                {c: _safe(today_row.get(c)) for c in FEATURE_COLS if c in df.columns},
+            )
+            RESEARCH_STORE.upsert_prediction(ticker, date_iso, row)
+            RESEARCH_STORE.insert_model_metrics(
+                ticker,
+                {
+                    "run_ts": datetime.now().isoformat(),
+                    "training_mode": train_mode if "train_mode" in locals() else None,
+                    "best_val_loss": best_val if "best_val" in locals() else None,
+                    "mape": error_stats.mape_recent,
+                    "directional_accuracy": error_stats.directional_acc,
+                    "drift": drift_report if "drift_report" in locals() else {},
+                },
+            )
+            EXPERIMENTS.log_run(
+                f"{ticker}-{date_iso}",
+                {
+                    "ticker": ticker,
+                    "seq_length": SEQ_LENGTH,
+                    "force_retrain": force_retrain,
+                    "regime": row.get("Market_Regime"),
+                },
+                {
+                    "error2_pct": error2_pct or 0.0,
+                    "mape_recent": error_stats.mape_recent,
+                    "directional_acc": error_stats.directional_acc,
+                },
+                tags={"component": "nifty100tracker"},
+            )
+        except Exception as e:
+            log.warning("[%s] SQLite/experiment write failed: %s", ticker, e)
+
         log.info(
             "[%s] ✓ Row appended | Close=%.2f | TodayPred=%.2f | TomPred=%.2f | "
             "Err2=%.2f%% | Calib=%s",
@@ -1308,6 +1403,12 @@ def run_all(
     skipped = sum(1 for s in results.values() if "skipped" in s)
     errors  = sum(1 for s in results.values() if s == "error")
     log.info("══ SUMMARY: %d OK | %d Skipped | %d Errors ══", ok, skipped, errors)
+    if errors:
+        NOTIFICATIONS.notify(
+            "NIFTY100 tracker errors",
+            f"{errors} tickers failed on {target.isoformat()}: "
+            f"{', '.join(t for t, s in results.items() if s == 'error')}",
+        )
     return results
 
 
@@ -1345,7 +1446,27 @@ def main():
                         help="Daily run time in IST 24h (default: 16:00)")
     parser.add_argument("--show-meta",     type=str, default=None, metavar="TICKER",
                         help="Print model health JSON for a ticker and exit")
+    parser.add_argument("--calendar-status", action="store_true",
+                        help="Print the active NSE calendar source and today's status")
+    parser.add_argument("--backup-db", type=str, default=None, metavar="PATH",
+                        help="Back up the SQLite research database and exit")
     args = parser.parse_args()
+
+    if args.calendar_status:
+        open_, reason = is_market_open()
+        print(json.dumps({
+            "open": open_,
+            "reason": reason,
+            "source": EXCHANGE_CALENDAR.source,
+            "calendar_file": str(CALENDAR_FILE),
+            "database": str(DB_FILE),
+        }, indent=2))
+        return
+
+    if args.backup_db:
+        backup_path = RESEARCH_STORE.backup(Path(args.backup_db))
+        print(json.dumps({"backup": str(backup_path), "source": str(DB_FILE)}, indent=2))
+        return
 
     # Show model metadata and exit
     if args.show_meta:

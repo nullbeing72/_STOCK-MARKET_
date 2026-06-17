@@ -1,0 +1,9 @@
+numpy
+pandas
+plotly
+streamlit
+openpyxl
+yfinance
+scikit-learn
+torch
+schedule

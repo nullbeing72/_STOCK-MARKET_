@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+nifty100_data/
+nifty100_models/
+logs/
+tracker_state.json
+nifty100_research.db
+nifty100_research.db-*

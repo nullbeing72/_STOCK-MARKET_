@@ -38,6 +38,15 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+_HERE = Path(__file__).parent
+sys.path.insert(0, str(_HERE))
+from research_platform import (
+    optimize_portfolio,
+    rank_opportunities,
+    sector_rotation,
+    simple_backtest,
+)
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="NIFTY 100 · Quant Terminal",
@@ -50,7 +59,14 @@ st.set_page_config(
 OHLCV_COLS  = ["Open", "High", "Low", "Close", "Volume"]
 TECH_COLS   = ["SMA_10", "SMA_50", "MACD", "MACD_Signal", "RSI", "ROC_10",
                "Stoch_K", "BB_Upper", "BB_Lower", "ATR", "OBV_norm", "RVI"]
-QUANT_COLS  = ["Beta_60", "Alpha_60", "Momentum_12_1", "Sharpe_60", "Vol_Ratio", "Mkt_Return"]
+QUANT_COLS  = [
+    "Beta_60", "Alpha_60", "Momentum_12_1", "Sharpe_60", "Vol_Ratio", "Mkt_Return",
+    "Bond_5Y", "Bond_10Y", "Gold", "Silver", "Copper", "Aluminium", "Brent_Oil",
+    "Buffett_Proxy", "USDINR", "DXY", "India_VIX", "FII_Flow", "DII_Flow",
+    "Repo_Rate", "CPI_Inflation", "PMI", "GDP_Growth",
+    "PE_Ratio", "PB_Ratio", "EPS_Growth", "ROE", "ROCE",
+    "Debt_To_Equity", "Institutional_Ownership", "Regime_Confidence",
+]
 PRED_COLS   = ["Yest_Pred_Mean", "Yest_Pred_Std",
                "Today_Pred_Mean", "Today_Pred_Std", "Actual_Price",
                "Tomorrow_Pred_Mean", "Tomorrow_Pred_Std"]
@@ -1292,6 +1308,36 @@ def render_portfolio(data_dir: str, models_dir: str,
         fd.update_layout(**_L(title="Directional Accuracy by Ticker", height=270))
         _pc(fd, key="port_dir_acc")
 
+    ranked = rank_opportunities(rows)
+    if not ranked.empty:
+        st.markdown(f'<div class="sh">Stock Ranking Engine</div>', unsafe_allow_html=True)
+        show_cols = [
+            c for c in ["ticker", "side", "score", "confidence", "pct_change", "e2", "dir_acc"]
+            if c in ranked.columns
+        ]
+        st.dataframe(
+            ranked[show_cols].round(4),
+            use_container_width=True,
+            hide_index=True,
+            height=320,
+        )
+
+    sectors = sector_rotation(rows)
+    if not sectors.empty:
+        st.markdown(f'<div class="sh">Sector Rotation</div>', unsafe_allow_html=True)
+        st.dataframe(sectors.round(4), use_container_width=True, hide_index=True, height=260)
+
+    price_map = {}
+    for t in tickers[:40]:
+        d = load_ticker(t, data_dir)
+        if d is not None and not d.empty:
+            price_map[t] = date_filter(d, start, end).set_index("Date")
+    alloc = optimize_portfolio(price_map, method="mean_variance")
+    if not alloc.empty:
+        st.markdown(f'<div class="sh">Portfolio Optimization · Mean Variance</div>',
+                    unsafe_allow_html=True)
+        st.dataframe(alloc.round(4), use_container_width=True, hide_index=True, height=280)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -1371,6 +1417,24 @@ def main() -> None:
 
         _pc(fig_rolling_dir_acc(df, ticker, window=roll_acc_win), key="t0_rollacc")
         _pc(fig_scatter_pred(df, ticker), key="t0_scatter")
+        bt = simple_backtest(df)
+        if bt:
+            st.markdown(f'<div class="sh">Walk-Forward Style Signal Backtest</div>',
+                        unsafe_allow_html=True)
+            bcols = st.columns(6)
+            for col, (label, key) in zip(
+                bcols,
+                [
+                    ("CAGR", "cagr"),
+                    ("Sharpe", "sharpe"),
+                    ("Sortino", "sortino"),
+                    ("Max DD", "max_drawdown"),
+                    ("Win Rate", "win_rate"),
+                    ("Calmar", "calmar"),
+                ],
+            ):
+                suffix = "%" if key in {"cagr", "max_drawdown", "win_rate"} else ""
+                col.markdown(mc_card(label, f"{bt.get(key, 0)}{suffix}"), unsafe_allow_html=True)
 
     # ─────────────────────────────────────────────────────────────────────────
     # TAB 1 · Error Analysis

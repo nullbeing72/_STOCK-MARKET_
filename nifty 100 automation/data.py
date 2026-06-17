@@ -31,6 +31,10 @@ FACTOR_FEATURE_COLS: list[str] = [
     "Bond_5Y", "Bond_10Y",
     "Gold", "Silver", "Copper", "Aluminium", "Brent_Oil",
     "Buffett_Proxy",
+    "USDINR", "DXY", "India_VIX", "FII_Flow", "DII_Flow",
+    "Repo_Rate", "CPI_Inflation", "PMI", "GDP_Growth",
+    "PE_Ratio", "PB_Ratio", "EPS_Growth", "ROE", "ROCE",
+    "Debt_To_Equity", "Institutional_Ownership",
 ]
 
 FEATURE_COLS      = PRICE_FEATURE_COLS + FACTOR_FEATURE_COLS
@@ -54,6 +58,21 @@ _COMMODITY_TICKERS: dict[str, str] = {
     "Copper":    "HG=F",
     "Aluminium": "ALI=F",
     "Brent_Oil": "BZ=F",
+}
+
+_MACRO_TICKERS: dict[str, str] = {
+    "USDINR": "INR=X",
+    "DXY": "DX-Y.NYB",
+    "India_VIX": "^INDIAVIX",
+}
+
+_STATIC_MACRO_DEFAULTS: dict[str, float] = {
+    "FII_Flow": 0.0,
+    "DII_Flow": 0.0,
+    "Repo_Rate": 6.50,
+    "CPI_Inflation": 4.75,
+    "PMI": 56.0,
+    "GDP_Growth": 6.8,
 }
 
 # ── In-memory cache ───────────────────────────────────────────────────────────
@@ -312,6 +331,71 @@ def fetch_commodities(period_days: int) -> Optional[pd.DataFrame]:
         print(f"[fetch_commodities] {e}")
         return None
 
+
+def fetch_macro_indicators(period_days: int) -> Optional[pd.DataFrame]:
+    key = f"macro_v1:{period_days}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    try:
+        end = datetime.today()
+        start = end - timedelta(days=period_days + 100)
+        frames: dict[str, pd.Series] = {}
+        for name, ticker in _MACRO_TICKERS.items():
+            try:
+                raw = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+                raw = _normalize_columns(raw)
+                if raw is not None and not raw.empty and "Close" in raw.columns:
+                    frames[name] = pd.to_numeric(raw["Close"], errors="coerce")
+            except Exception as e:
+                print(f"[fetch_macro_indicators] {name}: {e}")
+
+        idx = None
+        if frames:
+            idx = pd.concat(frames.values(), axis=1).index
+        else:
+            idx = pd.bdate_range(start=start, end=end)
+
+        macro = pd.DataFrame(index=idx)
+        for name in _MACRO_TICKERS:
+            macro[name] = frames.get(name, pd.Series(index=idx, dtype=float))
+        for name, value in _STATIC_MACRO_DEFAULTS.items():
+            macro[name] = value
+
+        macro = macro.sort_index().asfreq("B").ffill().bfill()
+        return _cache_set(key, macro)
+    except Exception as e:
+        print(f"[fetch_macro_indicators] {e}")
+        return None
+
+
+def fetch_fundamentals(ticker: str) -> dict[str, float]:
+    key = f"fundamentals_v1:{ticker}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    metrics = {
+        "PE_Ratio": np.nan,
+        "PB_Ratio": np.nan,
+        "EPS_Growth": np.nan,
+        "ROE": np.nan,
+        "ROCE": np.nan,
+        "Debt_To_Equity": np.nan,
+        "Institutional_Ownership": np.nan,
+    }
+    try:
+        info = yf.Ticker(ticker).info or {}
+        metrics["PE_Ratio"] = info.get("trailingPE", np.nan)
+        metrics["PB_Ratio"] = info.get("priceToBook", np.nan)
+        metrics["EPS_Growth"] = info.get("earningsQuarterlyGrowth", np.nan)
+        metrics["ROE"] = info.get("returnOnEquity", np.nan)
+        metrics["ROCE"] = info.get("returnOnCapital", np.nan)
+        metrics["Debt_To_Equity"] = info.get("debtToEquity", np.nan)
+        metrics["Institutional_Ownership"] = info.get("heldPercentInstitutions", np.nan)
+    except Exception as e:
+        print(f"[fetch_fundamentals] {ticker}: {e}")
+    return _cache_set(key, metrics)
+
 # ── Feature engineering ───────────────────────────────────────────────────────
 def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -362,6 +446,8 @@ def add_quant_features(
     market_df: pd.DataFrame,
     bond_df: Optional[pd.DataFrame] = None,
     comm_df: Optional[pd.DataFrame] = None,
+    macro_df: Optional[pd.DataFrame] = None,
+    fundamentals: Optional[dict[str, float]] = None,
 ) -> pd.DataFrame:
     df        = df.copy()
     mkt_close = market_df["Close"].reindex(df.index, method="ffill")
@@ -419,6 +505,27 @@ def add_quant_features(
 
     spy_sma = mkt_close.rolling(252).mean().replace(0, np.nan)
     df["Buffett_Proxy"] = (mkt_close / spy_sma) * 100.0
+
+    # Macro/intermarket indicators. Daily market proxies are aligned to the
+    # stock index; slower economic series use explicit neutral defaults until a
+    # deployment provides authoritative history.
+    if macro_df is not None and not macro_df.empty:
+        aligned_macro = macro_df.reindex(df.index, method="ffill").bfill()
+    else:
+        aligned_macro = pd.DataFrame(index=df.index)
+
+    for col in list(_MACRO_TICKERS.keys()) + list(_STATIC_MACRO_DEFAULTS.keys()):
+        if col in aligned_macro.columns:
+            df[col] = aligned_macro[col]
+        else:
+            df[col] = _STATIC_MACRO_DEFAULTS.get(col, np.nan)
+
+    fundamentals = fundamentals or {}
+    for col in [
+        "PE_Ratio", "PB_Ratio", "EPS_Growth", "ROE", "ROCE",
+        "Debt_To_Equity", "Institutional_Ownership",
+    ]:
+        df[col] = fundamentals.get(col, np.nan)
 
     return df
 
