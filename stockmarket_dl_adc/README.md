@@ -46,7 +46,7 @@ quantitative finance features with modern deep-learning architectures.
 
 ---
 
-## 2. What Changed from v1 → v2
+## 2. What Changed from v1.0 → v1.1
 
 | Area | v1.0 | v1.1 |
 |---|---|---|
